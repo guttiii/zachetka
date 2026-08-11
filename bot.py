@@ -61,6 +61,23 @@ def save_config(cfg: dict):
 
 course_config = load_config()
 
+# Владелец нажал «Загрузить видео» в уроке — ждём от него следующий видеофайл.
+# { owner_id: {"lessonId": "d3", "title": "..."} }
+awaiting_video = {}
+
+
+def set_lesson_video(lesson_id: str, file_id: str) -> bool:
+    """Вписывает код видео в нужный урок опубликованного курса и сохраняет."""
+    global course_config
+    if not course_config or not isinstance(course_config.get("days"), list):
+        return False
+    for d in course_config["days"]:
+        if d.get("id") == lesson_id:
+            d["link"] = "tg-video:" + file_id
+            save_config(course_config)
+            return True
+    return False
+
 # ─── УЧЕНИКИ: постоянное хранилище (переживает перезапуск) ──────────────────
 STUDENTS_FILE = os.path.join(DATA_DIR, "students.json")
 
@@ -323,6 +340,22 @@ async def ai(request: Request):
         return JSONResponse({"text": f"Ошибка ИИ: {e}"})
 
 
+# ─── ЗАПРОС НА ЗАГРУЗКУ ВИДЕО ИЗ ПРИЛОЖЕНИЯ (только владелец) ───────────────
+@app.post("/upload-video")
+async def upload_video(request: Request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user or not OWNER_ID or user["id"] != OWNER_ID:
+        return JSONResponse({"ok": False, "error": "нет прав"}, status_code=403)
+    lesson_id = str(data.get("lessonId", ""))
+    title = data.get("title", "")
+    awaiting_video[OWNER_ID] = {"lessonId": lesson_id, "title": title}
+    await send_message(OWNER_ID,
+        f"🎬 Пришли сюда видео для урока «{title}» — следующим сообщением.\n\n"
+        "Как только загрузится, я сам впишу его в урок. Чтобы отменить — напиши /cancel.")
+    return JSONResponse({"ok": True})
+
+
 # ─── РЕШЕНИЕ ПО ЗАЯВКЕ ИЗ ПРИЛОЖЕНИЯ (только владелец) ──────────────────────
 @app.post("/decide")
 async def decide(request: Request):
@@ -364,23 +397,40 @@ async def webhook(request: Request):
 
     msg = update.get("message")
 
-    # Владелец прислал боту видео — выдаём код для поля «Ссылка на видео»
+    # Отмена ожидания видео
+    if msg and OWNER_ID and (msg.get("from") or {}).get("id") == OWNER_ID and msg.get("text", "").strip() == "/cancel":
+        if awaiting_video.pop(OWNER_ID, None):
+            await send_message(OWNER_ID, "Отменил. Видео не прикреплял.")
+            return {"ok": True}
+
+    # Владелец прислал боту видео
     if msg and OWNER_ID and (msg.get("from") or {}).get("id") == OWNER_ID:
         vid = msg.get("video") or msg.get("video_note")
         doc = msg.get("document")
         if not vid and doc and str(doc.get("mime_type", "")).startswith("video/"):
             vid = doc
         if vid:
+            pending = awaiting_video.pop(OWNER_ID, None)
+            if pending:
+                # Мы ждали видео для конкретного урока — вписываем и публикуем сразу
+                ok = set_lesson_video(pending["lessonId"], vid["file_id"])
+                if ok:
+                    await send_message(OWNER_ID,
+                        f"✅ Видео прикреплено к уроку «{pending['title']}» и опубликовано.\n\n"
+                        "Ученики уже могут его открыть — видео придёт им в чат с защитой "
+                        "от пересылки и скачивания.")
+                else:
+                    await send_message(OWNER_ID,
+                        "Не нашёл этот урок в опубликованном курсе. Сначала опубликуй курс "
+                        "(кнопка 🚀), потом снова нажми «Загрузить видео» у урока.")
+                return {"ok": True}
+            # Видео прислали просто так — выдаём код на случай ручной вставки
             code = "tg-video:" + vid["file_id"]
             await send_message(OWNER_ID,
-                "🎬 <b>Видео принято!</b>\n\n"
-                "1. Нажми на код ниже — он скопируется\n"
-                "2. В приложении открой урок в редакторе\n"
-                "3. Вставь код в поле «Ссылка на видео»\n"
-                "4. Нажми «🚀 Опубликовать»\n\n"
-                f"<code>{code}</code>\n\n"
-                "Когда ученик нажмёт этот урок — видео придёт ему в личный чат "
-                "с защитой: без кнопок «Переслать» и «Сохранить».")
+                "🎬 <b>Видео принято!</b>\n\nЧтобы прикрепить его к уроку, удобнее нажать "
+                "«Загрузить видео» прямо в редакторе урока. Либо вставь этот код вручную "
+                "в поле «Видео или ссылка»:\n\n"
+                f"<code>{code}</code>")
             return {"ok": True}
 
     if msg and msg.get("text", "").startswith("/start"):
