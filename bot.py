@@ -15,6 +15,7 @@
 """
 
 import hmac, hashlib, json, urllib.parse, asyncio, os
+import time
 from datetime import datetime, date
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -29,6 +30,9 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")             # для ИИ
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # твой Telegram user_id — только тебе доступен ИИ
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# Секрет для вебхука: Telegram присылает его в заголовке каждого запроса.
+# Поддельные запросы на /webhook (не от Telegram) отклоняются.
+WEBHOOK_SECRET = hashlib.sha256(("webhook:" + BOT_TOKEN).encode()).hexdigest()[:32]
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -157,15 +161,18 @@ def verify_init_data(init_data: str) -> dict | None:
         calc_hash = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
         if calc_hash != received_hash:
             return None
+        # Подпись свежая? Старше суток — не принимаем (защита от перехваченных подписей)
+        auth_date = int(parsed.get("auth_date", "0") or 0)
+        if not auth_date or (time.time() - auth_date) > 86400:
+            return None
         return json.loads(parsed.get("user", "{}"))
     except Exception:
         return None
 
 
-async def send_message(chat_id: int, text: str, buttons: list | None = None, protect: bool = False):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if protect:
-        payload["protect_content"] = True  # запрет пересылки и сохранения
+async def send_message(chat_id: int, text: str, buttons: list | None = None, protect: bool = True):
+    # protect=True по умолчанию: у ВСЕХ сообщений бота нет «Переслать» и «Сохранить»
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "protect_content": protect}
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": buttons}
     async with httpx.AsyncClient(timeout=15) as client:
@@ -334,6 +341,9 @@ async def decide(request: Request):
 # ─── МИНИМАЛЬНЫЙ ВЕБХУК БОТА: /start открывает приложение ───────────────────
 @app.post("/webhook")
 async def webhook(request: Request):
+    # Запрос точно от Telegram? Иначе отбрасываем (защита от поддельных «нажатий»)
+    if request.headers.get("x-telegram-bot-api-secret-token") != WEBHOOK_SECRET:
+        return JSONResponse({"ok": False}, status_code=403)
     update = await request.json()
 
     # Кнопки «Принять/Отклонить» под карточкой заявки в чате владельца
@@ -407,7 +417,9 @@ async def on_startup():
             await client.post(f"{TG_API}/setChatMenuButton", json={
                 "menu_button": {"type": "web_app", "text": "Дневник",
                                 "web_app": {"url": WEBAPP_URL}}})
-        print("✅ Кнопка-меню настроена. Приложение открывается из чата с ботом.")
+            await client.post(f"{TG_API}/setWebhook", json={
+                "url": WEBAPP_URL + "/webhook", "secret_token": WEBHOOK_SECRET})
+        print("✅ Кнопка-меню и защищённый вебхук настроены автоматически.")
     except Exception as e:
         print("Не удалось настроить кнопку:", e)
 
