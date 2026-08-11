@@ -35,9 +35,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # Здесь копится статистика. Для реального проекта замени на базу данных (SQLite/Postgres).
 progress = {}  # { user_id: {"viewed": set(), "done": set(), "name": str} }
 
-# Конфигурация курса, которую владелец публикует из приложения. Хранится в файле,
-# поэтому переживает перезапуск сервера. Ученики получают ровно её — готовый вариант.
-CONFIG_FILE = "config.json"
+# Все данные (курс, ученики) храним на постоянном диске. На Railway подключи Volume
+# с путём /data и добавь переменную DATA_DIR=/data — иначе диск стирается при пересборке.
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
 
 def load_config():
@@ -56,7 +58,7 @@ def save_config(cfg: dict):
 course_config = load_config()
 
 # ─── УЧЕНИКИ: постоянное хранилище (переживает перезапуск) ──────────────────
-STUDENTS_FILE = "students.json"
+STUDENTS_FILE = os.path.join(DATA_DIR, "students.json")
 
 
 def load_students() -> dict:
@@ -205,8 +207,8 @@ async def init(request: Request):
 
 @app.get("/config")
 async def get_config():
-    """Готовый опубликованный курс для ученика (читать может кто угодно)."""
-    return JSONResponse({"config": course_config})
+    """Курс больше не отдаётся публично — только через подписанный /init из Telegram."""
+    return JSONResponse({"config": None})
 
 
 @app.post("/config")
