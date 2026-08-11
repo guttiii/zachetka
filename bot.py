@@ -15,6 +15,7 @@
 """
 
 import hmac, hashlib, json, urllib.parse, asyncio, os
+from datetime import datetime, date
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,6 +55,92 @@ def save_config(cfg: dict):
 
 course_config = load_config()
 
+# ─── УЧЕНИКИ: постоянное хранилище (переживает перезапуск) ──────────────────
+STUDENTS_FILE = "students.json"
+
+
+def load_students() -> dict:
+    try:
+        with open(STUDENTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_students():
+    with open(STUDENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(students_db, f, ensure_ascii=False, indent=2)
+
+
+students_db = load_students()  # { "user_id": {name, username, status, joined, last_active, viewed:[], done:[]} }
+for _rec in students_db.values():
+    _rec.setdefault("status", "approved")  # кто был до системы заявок — уже одобрен
+
+
+def register_student(user: dict) -> bool:
+    """Регистрирует человека. Новый попадает со статусом «заявка». Возвращает True, если он новый."""
+    uid = str(user["id"])
+    if uid == str(OWNER_ID):
+        return False  # владелец — не ученик
+    rec = students_db.get(uid)
+    now = datetime.now().isoformat(timespec="seconds")
+    if not rec:
+        students_db[uid] = {
+            "name": (user.get("first_name", "") + " " + user.get("last_name", "")).strip() or "Ученик",
+            "username": user.get("username", ""),
+            "status": "pending",
+            "joined": now, "last_active": now, "viewed": [], "done": [],
+        }
+        save_students()
+        return True
+    rec["last_active"] = now
+    if user.get("first_name"):
+        rec["name"] = (user.get("first_name", "") + " " + user.get("last_name", "")).strip()
+    save_students()
+    return False
+
+
+async def notify_owner_request(uid: str):
+    """Карточка заявки владельцу с кнопками Принять/Отклонить."""
+    rec = students_db.get(uid)
+    if not rec or not OWNER_ID:
+        return
+    text = f"📥 <b>Новая заявка на курс</b>\n{rec['name']}" + (f" @{rec['username']}" if rec.get("username") else "")
+    buttons = [[{"text": "✅ Принять", "callback_data": f"req:ok:{uid}"},
+                {"text": "❌ Отклонить", "callback_data": f"req:no:{uid}"}]]
+    await send_message(OWNER_ID, text, buttons)
+
+
+async def decide_request(uid: str, status: str):
+    """Меняет статус заявки и сообщает человеку результат."""
+    rec = students_db.get(uid)
+    if not rec:
+        return
+    rec["status"] = status
+    save_students()
+    if status == "approved":
+        await send_message(int(uid), "🎉 Ваша заявка одобрена — доступ к курсу открыт!",
+                           buttons=[[{"text": "📓 Открыть дневник", "web_app": {"url": WEBAPP_URL}}]])
+    else:
+        await send_message(int(uid), "К сожалению, владелец курса не открыл вам доступ. Если это ошибка — напишите ему напрямую.")
+
+
+def active_label(iso: str) -> str:
+    """'сегодня' / 'вчера' / 'N дн. назад' для вкладки статистики."""
+    try:
+        d = (date.today() - datetime.fromisoformat(iso).date()).days
+        return "сегодня" if d <= 0 else "вчера" if d == 1 else f"{d} дн. назад"
+    except Exception:
+        return "—"
+
+
+def students_for_owner() -> list:
+    return [{"id": uid, "name": rec["name"], "username": rec.get("username", ""),
+             "status": rec.get("status", "approved"),
+             "viewed": rec.get("viewed", []), "done": rec.get("done", []),
+             "active": active_label(rec.get("last_active", ""))}
+            for uid, rec in students_db.items()]
+
 
 # ─── ПРОВЕРКА ПОДЛИННОСТИ (что запрос реально из Telegram) ──────────────────
 def verify_init_data(init_data: str) -> dict | None:
@@ -73,12 +160,22 @@ def verify_init_data(init_data: str) -> dict | None:
         return None
 
 
-async def send_message(chat_id: int, text: str, buttons: list | None = None):
+async def send_message(chat_id: int, text: str, buttons: list | None = None, protect: bool = False):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if protect:
+        payload["protect_content"] = True  # запрет пересылки и сохранения
     if buttons:
         payload["reply_markup"] = {"inline_keyboard": buttons}
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(f"{TG_API}/sendMessage", json=payload)
+
+
+async def send_video(chat_id: int, file_id: str, caption: str = ""):
+    """Отправляет видео с защитой: без «Переслать» и «Сохранить»."""
+    payload = {"chat_id": chat_id, "video": file_id, "caption": caption[:1024],
+               "parse_mode": "HTML", "protect_content": True}
+    async with httpx.AsyncClient(timeout=60) as client:
+        await client.post(f"{TG_API}/sendVideo", json=payload)
 
 
 # ─── СТРАНИЦА ПРИЛОЖЕНИЯ ────────────────────────────────────────────────────
@@ -94,7 +191,16 @@ async def init(request: Request):
     data = await request.json()
     user = verify_init_data(data.get("initData", ""))
     is_owner = bool(user and OWNER_ID and user["id"] == OWNER_ID)
-    return JSONResponse({"is_owner": is_owner, "config": course_config})
+    access = "owner"
+    if user and not is_owner:
+        is_new = register_student(user)
+        if is_new:
+            await notify_owner_request(str(user["id"]))
+        access = students_db.get(str(user["id"]), {}).get("status", "pending")
+    resp = {"is_owner": is_owner, "access": access, "config": course_config}
+    if is_owner:
+        resp["students"] = students_for_owner()
+    return JSONResponse(resp)
 
 
 @app.get("/config")
@@ -128,19 +234,40 @@ async def event(request: Request):
         return JSONResponse({"ok": False, "error": "bad initData"}, status_code=403)
 
     uid = user["id"]
-    name = user.get("first_name", "Ученик")
-    rec = progress.setdefault(uid, {"viewed": set(), "done": set(), "name": name})
+    register_student(user)
+    srec = students_db.get(str(uid))
+    if srec and srec.get("status") != "approved":
+        return JSONResponse({"ok": False, "error": "not approved"}, status_code=403)
     action = data.get("action")
     idx = data.get("index")
+    lesson_id = data.get("lessonId")
+
+    def mark(field, add=True):
+        if not srec or not lesson_id: return
+        arr = srec.setdefault(field, [])
+        if add and lesson_id not in arr: arr.append(lesson_id)
+        if not add and lesson_id in arr: arr.remove(lesson_id)
+        save_students()
+
+    if action == "complete":
+        mark("done", True)
+        return JSONResponse({"ok": True})
+    if action == "uncomplete":
+        mark("done", False)
+        return JSONResponse({"ok": True})
 
     if action == "lesson":
-        rec["viewed"].add(data.get("lessonId"))
+        mark("viewed", True)
         title = data.get("title", "")
         desc = data.get("desc", "")
         link = data.get("link", "")
-        text = f"🎬 <b>Урок {idx}. {title}</b>\n\n{desc}"
-        buttons = [[{"text": "▶ Смотреть урок", "url": link}]] if link else None
-        await send_message(uid, text, buttons)
+        if link.startswith("tg-video:"):
+            # Видео из хранилища Telegram: приходит лично, защищено от пересылки/скачивания
+            await send_video(uid, link.split(":", 1)[1], caption=f"🎬 <b>Урок {idx}. {title}</b>\n\n{desc}")
+        else:
+            text = f"🎬 <b>Урок {idx}. {title}</b>\n\n{desc}"
+            buttons = [[{"text": "▶ Смотреть урок", "url": link}]] if link and link.startswith("http") else None
+            await send_message(uid, text, buttons, protect=True)
 
     elif action == "homework":
         title = data.get("title", "")
@@ -187,18 +314,83 @@ async def ai(request: Request):
         return JSONResponse({"text": f"Ошибка ИИ: {e}"})
 
 
+# ─── РЕШЕНИЕ ПО ЗАЯВКЕ ИЗ ПРИЛОЖЕНИЯ (только владелец) ──────────────────────
+@app.post("/decide")
+async def decide(request: Request):
+    data = await request.json()
+    user = verify_init_data(data.get("initData", ""))
+    if not user or not OWNER_ID or user["id"] != OWNER_ID:
+        return JSONResponse({"ok": False, "error": "нет прав"}, status_code=403)
+    sid = str(data.get("studentId", ""))
+    decision = data.get("decision")
+    if sid not in students_db or decision not in ("approved", "rejected"):
+        return JSONResponse({"ok": False, "error": "плохой запрос"}, status_code=400)
+    await decide_request(sid, decision)
+    return JSONResponse({"ok": True, "students": students_for_owner()})
+
+
 # ─── МИНИМАЛЬНЫЙ ВЕБХУК БОТА: /start открывает приложение ───────────────────
 @app.post("/webhook")
 async def webhook(request: Request):
     update = await request.json()
+
+    # Кнопки «Принять/Отклонить» под карточкой заявки в чате владельца
+    cb = update.get("callback_query")
+    if cb:
+        cb_data = cb.get("data", "")
+        if cb_data.startswith("req:") and cb["from"]["id"] == OWNER_ID:
+            _, verdict, sid = cb_data.split(":", 2)
+            await decide_request(sid, "approved" if verdict == "ok" else "rejected")
+            rec = students_db.get(sid, {})
+            label = "✅ Принят" if verdict == "ok" else "❌ Отклонён"
+            async with httpx.AsyncClient(timeout=15) as client:
+                await client.post(f"{TG_API}/answerCallbackQuery", json={"callback_query_id": cb["id"], "text": label})
+                await client.post(f"{TG_API}/editMessageText", json={
+                    "chat_id": cb["message"]["chat"]["id"], "message_id": cb["message"]["message_id"],
+                    "text": f"{label}: {rec.get('name', '')}", "parse_mode": "HTML"})
+        return {"ok": True}
+
     msg = update.get("message")
+
+    # Владелец прислал боту видео — выдаём код для поля «Ссылка на видео»
+    if msg and OWNER_ID and (msg.get("from") or {}).get("id") == OWNER_ID:
+        vid = msg.get("video") or msg.get("video_note")
+        doc = msg.get("document")
+        if not vid and doc and str(doc.get("mime_type", "")).startswith("video/"):
+            vid = doc
+        if vid:
+            code = "tg-video:" + vid["file_id"]
+            await send_message(OWNER_ID,
+                "🎬 <b>Видео принято!</b>\n\n"
+                "1. Нажми на код ниже — он скопируется\n"
+                "2. В приложении открой урок в редакторе\n"
+                "3. Вставь код в поле «Ссылка на видео»\n"
+                "4. Нажми «🚀 Опубликовать»\n\n"
+                f"<code>{code}</code>\n\n"
+                "Когда ученик нажмёт этот урок — видео придёт ему в личный чат "
+                "с защитой: без кнопок «Переслать» и «Сохранить».")
+            return {"ok": True}
+
     if msg and msg.get("text", "").startswith("/start"):
         chat_id = msg["chat"]["id"]
-        await send_message(
-            chat_id,
-            "Привет! Это твоя зачётная книжка. Жми кнопку — откроются уроки, ДЗ и расписание.",
-            buttons=[[{"text": "📓 Открыть дневник", "web_app": {"url": WEBAPP_URL}}]],
-        )
+        u = msg.get("from") or {}
+        if OWNER_ID and u.get("id") == OWNER_ID:
+            await send_message(chat_id, "Привет, владелец! Открывай дневник — редактор и статистика внутри.",
+                               buttons=[[{"text": "📓 Открыть дневник", "web_app": {"url": WEBAPP_URL}}]])
+            return {"ok": True}
+        is_new = register_student(u) if u else False
+        status = students_db.get(str(u.get("id")), {}).get("status", "pending")
+        if status == "approved":
+            await send_message(chat_id, "Привет! Это твоя зачётная книжка. Жми кнопку — откроются уроки, ДЗ и расписание.",
+                               buttons=[[{"text": "📓 Открыть дневник", "web_app": {"url": WEBAPP_URL}}]])
+        elif status == "rejected":
+            await send_message(chat_id, "Доступ к курсу не открыт. Если это ошибка — напишите владельцу курса.")
+        else:
+            if is_new:
+                await notify_owner_request(str(u["id"]))
+                await send_message(chat_id, "📝 Заявка на доступ к курсу отправлена владельцу. Как только он её одобрит — бот пришлёт вам сообщение.")
+            else:
+                await send_message(chat_id, "⏳ Ваша заявка ещё на рассмотрении. Бот напишет, как только доступ откроют.")
     return {"ok": True}
 
 
